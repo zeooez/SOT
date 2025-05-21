@@ -1,9 +1,15 @@
-program SteamOverlayToggler;
+program steamoverlaytoggler;
 
 {$mode objfpc}{$H+}
 
 uses
-  Classes, SysUtils, Process;
+  Classes, SysUtils, Windows;
+
+const
+  // Windows API constants needed for file access
+  GENERIC_EXECUTE = $20000000;
+  FILE_SHARE_DELETE = $00000004;
+  CREATE_NO_WINDOW = $08000000;
 
 var
   DLLFiles: array of string;
@@ -15,86 +21,72 @@ var
   UserInput: Char;
   i: Integer;
 
-// Check if running as administrator
+// Check if running as administrator using Windows API directly
 function IsAdmin: Boolean;
 var
-  RunAsAdmin: TProcess;
-  ExitCode: Integer;
+  TokenHandle: THandle;
+  TokenInformation: TTokenElevation;
+  ReturnLength: DWORD;
 begin
   Result := False;
-  RunAsAdmin := TProcess.Create(nil);
+  TokenHandle := 0;
+  ReturnLength := 0;
+
+  if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, TokenHandle) then
   try
-    RunAsAdmin.Executable := 'net';
-    RunAsAdmin.Parameters.Add('session');
-    RunAsAdmin.Options := RunAsAdmin.Options + [poWaitOnExit, poNoConsole];
-    RunAsAdmin.Execute;
-    ExitCode := RunAsAdmin.ExitStatus;
-    Result := (ExitCode = 0);
+    if GetTokenInformation(TokenHandle, TokenElevation, @TokenInformation,
+                          SizeOf(TokenInformation), ReturnLength) then
+    begin
+      Result := TokenInformation.TokenIsElevated <> 0;
+    end;
   finally
-    RunAsAdmin.Free;
+    CloseHandle(TokenHandle);
   end;
 end;
 
-// Check if file permissions are restricted
+// Check if file permissions are restricted by trying to open the file with execute access
 function IsRestricted(const FilePath: string): Boolean;
 var
-  CheckProcess: TProcess;
-  OutputFile: TextFile;
-  TempFileName: string;
-  OutputLine: string;
+  FileHandle: THandle;
 begin
-  Result := False;
-  TempFileName := GetTempDir + 'overlay_check_' + IntToStr(Random(100000)) + '.txt';
-  
-  CheckProcess := TProcess.Create(nil);
-  try
-    CheckProcess.Executable := 'cmd.exe';
-    CheckProcess.Parameters.Add('/c');
-    CheckProcess.Parameters.Add('icacls "' + FilePath + '" > "' + TempFileName + '"');
-    CheckProcess.Options := CheckProcess.Options + [poWaitOnExit, poNoConsole];
-    CheckProcess.Execute;
-    
-    // Read the temporary file
-    AssignFile(OutputFile, TempFileName);
-    try
-      Reset(OutputFile);
-      while not EOF(OutputFile) do
-      begin
-        ReadLn(OutputFile, OutputLine);
-        if (Pos('Everyone:(DENY)', OutputLine) > 0) or (Pos('*S-1-1-0:(DENY)', OutputLine) > 0) then
-        begin
-          Result := True;
-          Break;
-        end;
-      end;
-    finally
-      CloseFile(OutputFile);
-      DeleteFile(TempFileName);
-    end;
-  finally
-    CheckProcess.Free;
-  end;
+  FileHandle := CreateFile(PChar(FilePath),
+                           GENERIC_READ or GENERIC_EXECUTE,
+                           FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+                           nil,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL,
+                           0);
+
+  Result := (FileHandle = INVALID_HANDLE_VALUE);
+
+  if FileHandle <> INVALID_HANDLE_VALUE then
+    CloseHandle(FileHandle);
 end;
 
-// Run a process and get the success status
-function RunProcess(const Executable, Arguments: string): Boolean;
+// Execute a Windows command safely
+function ExecuteCommand(const Command: string): Boolean;
 var
-  Proc: TProcess;
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  CmdLine: array[0..1023] of Char;
 begin
-  Proc := TProcess.Create(nil);
-  try
-    Proc.Executable := Executable;
-    // Split the arguments into the parameter list
-    if Arguments <> '' then
-    begin
-      Proc.Parameters.Clear;
-      Proc.Parameters.Add(Arguments);
-    end;
-    Proc.Options := Proc.Options + [poWaitOnExit, poNoConsole];
-    Proc.Execute;
-    Result := (Proc.ExitStatus = 0);
-  finally
-    Proc.Free;
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESHOWWINDOW;
+  SI.wShowWindow := SW_HIDE;
+
+  FillChar(PI, SizeOf(PI), 0);
+
+  StrPCopy(CmdLine, Command);
+
+  Result := CreateProcess(nil, CmdLine, nil, nil, False,
+                          CREATE_NO_WINDOW, nil, nil, SI, PI);
+
+  if Result then
+  begin
+    WaitForSingleObject(PI.hProcess, INFINITE);
+    CloseHandle(PI.hProcess);
+    CloseHandle(PI.hThread);
   end;
 end;
 
@@ -102,45 +94,42 @@ end;
 procedure RestrictPermissions(const FilePath: string);
 var
   FileName: string;
-  Success: Boolean;
+  Command: string;
 begin
   FileName := ExtractFileName(FilePath);
   WriteLn('Disabling overlay for: ', FileName);
-  
-  RunProcess('cmd.exe', '/c takeown /F "' + FilePath + '" /A');
-  Success := RunProcess('cmd.exe', '/c icacls "' + FilePath + '" /deny *S-1-1-0:(RX)');
-  
-  if not Success then
-    WriteLn('ERROR: Failed to set permissions for ', FileName)
+
+  Command := 'cmd.exe /c takeown /F "' + FilePath + '" /A && icacls "' + FilePath + '" /deny *S-1-1-0:(RX)';
+  if ExecuteCommand(Command) then
+    WriteLn('- Done.')
   else
-    WriteLn('- Done.');
+    WriteLn('ERROR: Failed to set permissions for ', FileName);
 end;
 
 // Restore permissions on a file
 procedure RestorePermissions(const FilePath: string);
 var
   FileName: string;
-  Success: Boolean;
+  Command: string;
 begin
   FileName := ExtractFileName(FilePath);
   WriteLn('Enabling overlay for: ', FileName);
-  
-  RunProcess('cmd.exe', '/c takeown /F "' + FilePath + '" /A');
-  Success := RunProcess('cmd.exe', '/c icacls "' + FilePath + '" /remove:d *S-1-1-0');
-  
-  if not Success then
-    WriteLn('ERROR: Failed to restore permissions for ', FileName)
+
+  Command := 'cmd.exe /c takeown /F "' + FilePath + '" /A && icacls "' + FilePath + '" /remove:d *S-1-1-0';
+  if ExecuteCommand(Command) then
+    WriteLn('- Done.')
   else
-    WriteLn('- Done.');
+    WriteLn('ERROR: Failed to restore permissions for ', FileName);
 end;
 
+{$R *.res}
+
 begin
-  Randomize; // Initialize random number generator
   WriteLn('Steam Overlay Permission Toggle');
   WriteLn('==============================');
   WriteLn;
-  
-  // Check for admin rights
+
+  // Check for admin rights using Windows API
   if not IsAdmin then
   begin
     WriteLn('ERROR: Administrator privileges required.');
@@ -149,18 +138,18 @@ begin
     ReadLn;
     Exit;
   end;
-  
+
   // Define target DLLs
   SetLength(DLLFiles, 4);
   DLLFiles[0] := 'GameOverlayRenderer.dll';
   DLLFiles[1] := 'GameOverlayRenderer64.dll';
   DLLFiles[2] := 'SteamOverlayVulkanLayer.dll';
   DLLFiles[3] := 'SteamOverlayVulkanLayer64.dll';
-  
+
   // Search for DLLs in current directory
   CurrentDir := ExtractFilePath(ParamStr(0));
   WriteLn('Searching for Steam overlay DLLs...');
-  
+
   FoundFiles := TStringList.Create;
   try
     for i := 0 to Length(DLLFiles) - 1 do
@@ -171,9 +160,9 @@ begin
         FoundFiles.Add(CurrentDir + DLLFiles[i]);
       end;
     end;
-    
+
     FilesFound := FoundFiles.Count;
-    
+
     if FilesFound = 0 then
     begin
       WriteLn('ERROR: No Steam overlay DLLs found in this directory.');
@@ -182,12 +171,12 @@ begin
       ReadLn;
       Exit;
     end;
-    
+
     WriteLn('Found ', FilesFound, ' Steam overlay DLL files.');
-    
+
     // Check current status using first file
     CurrentlyRestricted := IsRestricted(FoundFiles[0]);
-    
+
     WriteLn;
     if CurrentlyRestricted then
     begin
@@ -203,11 +192,11 @@ begin
       WriteLn('This application will DISABLE the Steam overlay by restricting permissions.');
       ActionToTake := 'DISABLE';
     end;
-    
+
     WriteLn;
     Write('Do you want to ', ActionToTake, ' the Steam Overlay? (Y/N): ');
     ReadLn(UserInput);
-    
+
     if UpCase(UserInput) <> 'Y' then
     begin
       WriteLn;
@@ -216,11 +205,11 @@ begin
       ReadLn;
       Exit;
     end;
-    
+
     WriteLn;
     WriteLn('Proceeding with the change...');
     WriteLn;
-    
+
     // Process each DLL file
     for i := 0 to FoundFiles.Count - 1 do
     begin
@@ -229,7 +218,7 @@ begin
       else
         RestrictPermissions(FoundFiles[i]);
     end;
-    
+
     WriteLn;
     if CurrentlyRestricted then
     begin
@@ -241,7 +230,7 @@ begin
   finally
     FoundFiles.Free;
   end;
-  
+
   WriteLn;
   WriteLn('Press Enter to exit...');
   ReadLn;
